@@ -14,6 +14,7 @@ import yaml
 import argparse
 import os
 import sys
+import gc
 import torch
 import json
 from pathlib import Path
@@ -89,7 +90,7 @@ def load_model_from_checkpoint(checkpoint_path, model_cfg, device):
 def run_inference(model_cfg=None, model=None, checkpoint_path=None,
                   scene_dataloader=None, device='cuda:0',
                   save_results=True, output_dir=None, novel_distances=[1.0, 2.0],
-                  eval_resolution='280x518'):
+                  eval_resolution='280x518', frame_skip=6, max_samples_per_scene=None):
     """
     Scene-based inference function for single GPU
 
@@ -113,7 +114,17 @@ def run_inference(model_cfg=None, model=None, checkpoint_path=None,
             raise ValueError("model_cfg and checkpoint_path required when model is None")
         model = load_model_from_checkpoint(checkpoint_path, model_cfg, device)
 
-    return _run_single_gpu_inference(model, scene_dataloader, device, save_results, output_dir, novel_distances, eval_resolution)
+    return _run_single_gpu_inference(
+        model,
+        scene_dataloader,
+        device,
+        save_results,
+        output_dir,
+        novel_distances,
+        eval_resolution,
+        frame_skip=frame_skip,
+        max_samples_per_scene=max_samples_per_scene,
+    )
 
 
 def save_rendered_image(tensor_img, save_path, upsample_to=None):
@@ -142,6 +153,16 @@ def save_rendered_image(tensor_img, save_path, upsample_to=None):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     
     Image.fromarray(img_np).save(save_path)
+
+
+def parse_eval_resolution(eval_resolution, model_height, model_width):
+    """Resolve evaluation resolution aliases to concrete height/width."""
+    if eval_resolution == 'original':
+        return model_height, model_width
+    if eval_resolution == 'upsampled':
+        return 900, 1600
+    resize_height, resize_width = eval_resolution.split('x')
+    return int(resize_height), int(resize_width)
 
 
 def create_lateral_translation_matrices(translation_distances=[1.0, 2.0]):
@@ -214,9 +235,9 @@ def render_novel_views(model, recontrast_data, render_data, device, scene_name, 
                 save_path = os.path.join(save_dir, scene_name, 
                                         f'sample_{global_sample_idx:04d}', transform_name, f'{eval_resolution}_cam_{cam_id}.png')
             
-                resize_height, resize_width = eval_resolution.split('x')
-                resize_height = int(resize_height)
-                resize_width = int(resize_width)
+                resize_height, resize_width = parse_eval_resolution(
+                    eval_resolution, model_height, model_width
+                )
                 if resize_height !=model_height or resize_width != model_width:
                     save_rendered_image(render_rgb, save_path, upsample_to=(resize_height, resize_width))
                 else:  # eval_resolution == 'original'
@@ -251,7 +272,21 @@ def _extract_scene_idx(scene_batch, default_idx=0):
             return _extract_first_value(scene_batch[key]['scene_idx'], default_idx)
     return default_idx
 
-def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True, output_dir=None, novel_distances=[1.0, 2.0], eval_resolution='280x518', batch_idx=0):
+def maybe_release_cuda_memory(device):
+    """Best-effort GPU memory release between samples."""
+    if isinstance(device, str):
+        is_cuda = device.startswith('cuda')
+    else:
+        is_cuda = getattr(device, 'type', None) == 'cuda'
+
+    if is_cuda and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
+def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True, output_dir=None,
+                         novel_distances=[1.0, 2.0], eval_resolution='280x518', batch_idx=0,
+                         frame_skip=6, max_samples_per_scene=None):
     """Process a single scene batch and return results"""
     scene_start_time = time.time()
 
@@ -260,8 +295,6 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
     
     # Initialize original_sample_indices to track the actual frame indices
     original_sample_indices = None
-    frame_skip = 6
-
     # Support both lazy loading and pre-loaded modes
     if 'samples' in scene_batch:
         scene_samples = scene_batch['samples']
@@ -304,6 +337,25 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
                 scene_idx=scene_batch['scene_idx']
             )
             actual_samples = len(all_indices)
+
+    if max_samples_per_scene is not None:
+        limited_count = min(max_samples_per_scene, len(original_sample_indices))
+        original_sample_indices = original_sample_indices[:limited_count]
+        actual_samples = limited_count
+
+        if 'samples' in scene_batch:
+            filtered_samples = [scene_samples[i] for i in original_sample_indices]
+            scene_dataset = SceneSampleDataset(filtered_samples)
+        else:
+            scene_dataset = SceneSampleDataset(
+                original_sample_indices,
+                dataset=scene_batch['dataset'],
+                scene_idx=scene_batch['scene_idx']
+            )
+
+        print(
+            f"GPU {gpu_id}: Limiting scene to {actual_samples} sample(s) after frame skipping"
+        )
     
     print(f"GPU {gpu_id}: Processing Scene: {scene_name} ({actual_samples} samples)")
     
@@ -319,6 +371,10 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
 
     for batch_data in scene_loader:
         batch_count += 1
+        output = None
+        batch_recontrast_data = None
+        batch_render_data = None
+        batch_splating_data = None
         
         # Get the actual sample index from the original data
         if original_sample_indices is not None:
@@ -342,6 +398,11 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
 
         if isinstance(output, tuple):
             batch_recontrast_data, batch_render_data, batch_splating_data = output
+
+            if not save_renders:
+                # These are only needed for extra novel-view exports.
+                batch_recontrast_data = None
+                batch_render_data = None
             
             # Calculate metrics for this batch
             batch_psnr, batch_ssim, batch_lpips = [], [], []
@@ -372,9 +433,9 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
                         pred = batch_splating_data[pred_key][0:1]
                         gt = batch_splating_data[gt_key][0:1]
 
-                        resize_height, resize_width = eval_resolution.split('x')
-                        resize_height = int(resize_height)
-                        resize_width = int(resize_width)
+                        resize_height, resize_width = parse_eval_resolution(
+                            eval_resolution, model_height, model_width
+                        )
                         if (resize_height == model_height) and (resize_width == model_width):
                             pred_eval = pred.clamp(0, 1)
                             gt_eval = gt.clamp(0, 1)
@@ -418,9 +479,9 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
                         pred = batch_splating_data[pred_key][0:1]
                         gt = batch_splating_data[gt_key][0:1]
 
-                        resize_height, resize_width = eval_resolution.split('x')
-                        resize_height = int(resize_height)
-                        resize_width = int(resize_width)
+                        resize_height, resize_width = parse_eval_resolution(
+                            eval_resolution, model_height, model_width
+                        )
                         if (resize_height == model_height) and (resize_width == model_width):
                             # Original mode: Use original model resolution (280x518)
                             if frame_id == 0 and cam_id == 0:
@@ -493,7 +554,10 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
             scene_psnr_list.extend(recon_psnr + novel_psnr)
             scene_ssim_list.extend(recon_ssim + novel_ssim)
             scene_lpips_list.extend(recon_lpips + novel_lpips)
-            
+        
+        del batch_data, output, batch_recontrast_data, batch_render_data, batch_splating_data
+        gc.collect()
+        maybe_release_cuda_memory(device)
 
     # Calculate processing time
     scene_processing_time = time.time() - scene_start_time
@@ -533,7 +597,9 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
     }
 
 
-def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True, output_dir=None, novel_distances=[1.0, 2.0], eval_resolution='280x518'):
+def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True, output_dir=None,
+                              novel_distances=[1.0, 2.0], eval_resolution='280x518',
+                              frame_skip=6, max_samples_per_scene=None):
     """Run inference on all scenes - simplified using unified scene processing"""
     print(f"\nStarting scene-based inference on device: {device}")
     print(f"Number of scenes: {len(scene_dataloader)}")
@@ -551,7 +617,8 @@ def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True
             result = _process_scene_batch(model, scene_batch, device, gpu_id=0,
                                         save_renders=save_results, output_dir=output_dir,
                                         novel_distances=novel_distances, eval_resolution=eval_resolution,
-                                        batch_idx=scene_idx)
+                                        batch_idx=scene_idx, frame_skip=frame_skip,
+                                        max_samples_per_scene=max_samples_per_scene)
 
             all_scene_results.append(result)
             overall_psnr.extend(result['sample_metrics']['psnr_list'])
@@ -702,11 +769,17 @@ def main():
     parser = argparse.ArgumentParser(description='Scene-based inference for VGGT3DGS')
     parser.add_argument('--cfg_path', type=str, required=True, help='Configuration file path')
     parser.add_argument('--restore_ckpt', type=str, required=True, help='Checkpoint path')
+    parser.add_argument('--data_path', type=str, default=None, help='Override the dataset root from the config file')
+    parser.add_argument('--vggt_checkpoint', type=str, default=None, help='Override the VGGT checkpoint from the config file')
+    parser.add_argument('--sam2_checkpoint', type=str, default=None, help='Override the SAM2 checkpoint from the config file')
     parser.add_argument('--output_dir', type=str, default=None, help='Output directory for results')
     parser.add_argument('--max_scenes', type=int, default=None, help='Maximum number of scenes to process (default: all scenes)')
     parser.add_argument('--device', type=str, default=None, help='Device to use (e.g., cuda:0)')
 
     parser.add_argument('--no_renders', action='store_true', help='Disable saving rendered images and novel views')
+    parser.add_argument('--frame_skip', type=int, default=6, help='Keep every Nth sample within each scene')
+    parser.add_argument('--max_samples_per_scene', type=int, default=None,
+                       help='Maximum number of samples to process per scene after frame skipping')
     parser.add_argument('--novel_distances', type=str, default='0.5,1.0,2.0,3.0', 
                        help='Novel view translation distances in meters (comma-separated, e.g., "0.5,1.0,2.0,3.0")')
     parser.add_argument('--eval_resolution', type=str, default='original',# choices=['original', 'upsampled'],
@@ -718,6 +791,25 @@ def main():
     print(f"Loading configuration from: {args.cfg_path}")
     with open(args.cfg_path) as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
+
+    if args.data_path:
+        config['data_cfg']['data_path'] = args.data_path
+    if args.vggt_checkpoint:
+        config['model_cfg']['vggt_checkpoint'] = args.vggt_checkpoint
+    if args.sam2_checkpoint:
+        config['model_cfg']['sam2_checkpoint'] = args.sam2_checkpoint
+
+    if not os.path.exists(args.restore_ckpt):
+        raise FileNotFoundError(f"Checkpoint does not exist: {args.restore_ckpt}")
+
+    if not os.path.isdir(config['data_cfg']['data_path']):
+        raise FileNotFoundError(
+            f"Dataset root does not exist: {config['data_cfg']['data_path']}"
+        )
+    if not os.path.exists(config['model_cfg']['vggt_checkpoint']):
+        raise FileNotFoundError(
+            f"VGGT checkpoint does not exist: {config['model_cfg']['vggt_checkpoint']}"
+        )
     
     # Set batch_size to 1 for inference (CRITICAL: must be 1 for proper scene processing)
     config['model_cfg']['batch_size'] = 1
@@ -733,7 +825,9 @@ def main():
     # Parse device
     if args.device:
         # Single GPU specified: "cuda:0" or "0"
-        if args.device.startswith('cuda:'):
+        if args.device == 'cpu':
+            device = 'cpu'
+        elif args.device.startswith('cuda:'):
             device = args.device
         else:
             device = f"cuda:{args.device}"
@@ -761,6 +855,8 @@ def main():
         raise ValueError(f"Invalid novel_distances format: {args.novel_distances}. Use comma-separated floats like '0.5,1.0,2.0,3.0'")
     
     print(f"Save renders: {save_renders}")
+    print(f"Frame skip: {args.frame_skip}")
+    print(f"Max samples per scene: {args.max_samples_per_scene}")
     print(f"Novel view distances: {novel_distances}")
     print(f"Evaluation resolution: {args.eval_resolution}")
 
@@ -799,6 +895,8 @@ def main():
         device=device,
         save_results=save_renders,
         output_dir=args.output_dir,
+        frame_skip=args.frame_skip,
+        max_samples_per_scene=args.max_samples_per_scene,
         novel_distances=novel_distances,
         eval_resolution=args.eval_resolution,
     )

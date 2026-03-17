@@ -78,19 +78,27 @@ class NuScenesdataset4D(Dataset):
 
         self.dataset = NuScenes(version=self.version, dataroot=self.path, verbose=True)
 
-        if stage == 'train':
-            official_scene_names = splits.train  
-        elif stage == 'val':
-            official_scene_names = splits.val    
-        elif stage == 'test':
-            official_scene_names = [
-                'scene-0014', 'scene-0018', 'scene-0906', 'scene-0098',
-                'scene-0100', 'scene-0103', 'scene-0270', 'scene-0271',
-                'scene-0278', 'scene-0553', 'scene-0558', 
-                'scene-0802', 'scene-0968',  'scene-1065',
-            ]
+        if self.version == 'v1.0-mini':
+            if stage == 'train':
+                official_scene_names = splits.mini_train
+            elif stage in ('val', 'test'):
+                official_scene_names = splits.mini_val
+            else:
+                raise ValueError("stage should be 'train' / 'val'/ 'test' ")
         else:
-            raise ValueError("stage should be 'train' / 'val'/ 'test' ")
+            if stage == 'train':
+                official_scene_names = splits.train
+            elif stage == 'val':
+                official_scene_names = splits.val
+            elif stage == 'test':
+                official_scene_names = [
+                    'scene-0014', 'scene-0018', 'scene-0906', 'scene-0098',
+                    'scene-0100', 'scene-0103', 'scene-0270', 'scene-0271',
+                    'scene-0278', 'scene-0553', 'scene-0558',
+                    'scene-0802', 'scene-0968',  'scene-1065',
+                ]
+            else:
+                raise ValueError("stage should be 'train' / 'val'/ 'test' ")
 
         self.min_context_num = min_context_num
         self.num_context_timesteps = num_context_timesteps

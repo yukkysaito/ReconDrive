@@ -13,7 +13,11 @@ from einops import einsum
 
 import numpy as np
 
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+try:
+    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+except ImportError:
+    GaussianRasterizationSettings = None
+    GaussianRasterizer = None
 
 
 def render(novel_FovX, 
@@ -36,6 +40,8 @@ def render(novel_FovX,
     
     Background tensor (bg_color) must be on GPU!
     """
+    if GaussianRasterizationSettings is None or GaussianRasterizer is None:
+        raise ImportError("diff_gaussian_rasterization is required for render()")
     bg_color = torch.tensor(bg_color, dtype=torch.float32).cuda()
  
     screenspace_points = torch.zeros_like(pts_xyz, dtype=torch.float32, requires_grad=True).cuda()
@@ -194,9 +200,12 @@ def rotate_sh(
 
     *_, n = sh_coefficients.shape
     alpha, beta, gamma = matrix_to_angles(rotations)
+    alpha_cpu = alpha.to("cpu")
+    beta_cpu = beta.to("cpu")
+    gamma_cpu = gamma.to("cpu")
     result = []
     for degree in range(isqrt(n)):
-        sh_rotations = wigner_D(degree, alpha, beta, gamma).type(dtype)
+        sh_rotations = wigner_D(degree, alpha_cpu, beta_cpu, gamma_cpu).to(device=device, dtype=dtype)
         sh_rotated = einsum(
             sh_rotations,
             sh_coefficients[..., degree**2 : (degree + 1) ** 2],

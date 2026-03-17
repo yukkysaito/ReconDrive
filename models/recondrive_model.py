@@ -18,7 +18,6 @@ import numpy as np
 import pytorch_lightning as pl
 from einops import rearrange, reduce
 from torch import Tensor
-from torch_scatter import scatter_add, scatter_max
 from lpips import LPIPS
 from jaxtyping import Float, UInt8
 from pytorch_lightning.utilities import rank_zero_only
@@ -28,11 +27,55 @@ from math import log2, log
 import sys
 from gsplat.rendering import rasterization
 import cv2
-from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
 import matplotlib.pyplot as plt
 from pathlib import Path
 from torch.utils.checkpoint import checkpoint
+
+try:
+    from torch_scatter import scatter_add, scatter_max
+except ImportError:
+    def _infer_dim_size(index, dim_size):
+        if dim_size is not None:
+            return dim_size
+        if index.numel() == 0:
+            return 0
+        return int(index.max().item()) + 1
+
+    def scatter_add(src, index, dim=0, dim_size=None):
+        if dim != 0:
+            raise NotImplementedError("Fallback scatter_add only supports dim=0")
+        dim_size = _infer_dim_size(index, dim_size)
+        out_shape = list(src.shape)
+        out_shape[dim] = dim_size
+        out = src.new_zeros(out_shape)
+        if index.numel() == 0:
+            return out
+        out.index_add_(0, index, src)
+        return out
+
+    def scatter_max(src, index, dim=0, dim_size=None):
+        if dim != 0:
+            raise NotImplementedError("Fallback scatter_max only supports dim=0")
+        dim_size = _infer_dim_size(index, dim_size)
+        out_shape = list(src.shape)
+        out_shape[dim] = dim_size
+        if torch.is_floating_point(src):
+            fill_value = torch.finfo(src.dtype).min
+        else:
+            fill_value = torch.iinfo(src.dtype).min
+        out = src.new_full(out_shape, fill_value)
+        if index.numel() == 0:
+            return out, None
+        expanded_index = index.view(-1, *([1] * (src.dim() - 1))).expand_as(src)
+        out.scatter_reduce_(0, expanded_index, src, reduce="amax", include_self=True)
+        return out, None
+
+try:
+    from sam2.build_sam import build_sam2
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+except ImportError:
+    build_sam2 = None
+    SAM2ImagePredictor = None
 
 from models.vggt.models.vggt import VGGT
 from models.vggt.heads.dpt_head import DPTHead
@@ -571,6 +614,14 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         # Set default values for ego transformation configuration if not in config
         if not hasattr(self, 'translate_3dgs'):
             self.translate_3dgs = False
+        if not hasattr(self, 'use_latest_gsplat'):
+            self.use_latest_gsplat = True
+        if not hasattr(self, 'num_motion_tokens'):
+            self.num_motion_tokens = 0
+        if not hasattr(self, 'near'):
+            self.near = getattr(self, 'min_depth', 0.1)
+        if not hasattr(self, 'far'):
+            self.far = getattr(self, 'max_depth', 100.0)
         self.save_visualizations = False # True
 
         self.save_dir = save_dir
@@ -1094,6 +1145,9 @@ class ReconDrive_LITModelModule(pl.LightningModule):
     
     def init_sam2(self):
         """Initialize SAM2 model for vehicle segmentation"""
+        if build_sam2 is None or SAM2ImagePredictor is None:
+            self.sam2_predictor = None
+            return
         try:
             checkpoint = getattr(self, 'sam2_checkpoint', None)
             model_cfg = getattr(self, 'sam2_model_cfg', "configs/sam2.1/sam2.1_hiera_s.yaml")

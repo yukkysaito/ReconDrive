@@ -1,0 +1,65 @@
+save_dir: './work_dirs/recondrive_mcap_camera0_5'
+seed: 1
+train_epoch: 2
+devices: [0]
+
+
+model_cfg:
+  height: 280
+  width: 518
+  render_width_min: 259
+  render_width_max: 768
+  num_cams: 6
+  embed_dim: 1024
+  auto_scale_lr: True
+  learning_rate: 0.00001
+  weight_decay: 0.01
+  lr_restart_epoch: 5
+  lr_restart_mult: 2
+  lr_min_factor: 0.01
+
+  frame_ids: [0, 1]
+
+  use_vehicle_flow: false
+
+  depth_conf_thr: 0.99
+  min_depth: 1.5
+  max_depth: 110
+  focal_length_scale: 300
+  sh_degree: 4
+
+  save_image_duration: 100
+
+  lambda_project: 1.0
+  lambda_edge: 0.1
+  lambda_depth: 0.001
+  lambda_gaussian: 2
+  lambda_scale: 0.01
+  lambda_opacity: 0.01
+
+  vggt_checkpoint: './downloaded_checkpoints/vggt_model.pt'
+  sam2_checkpoint: 'checkpoints/sam2.1_hiera_small.pt'
+  sam2_model_cfg: 'configs/sam2.1/sam2.1_hiera_s.yaml'
+  sam2_dir: null
+
+
+data_cfg:
+  dataset_type: 'mcap_preprocessed'
+  data_path: './data/mcap_camera0_5_smoke'
+  cache_dir: './work_dirs/cache_data/mcap_camera0_5_smoke'
+  height: 280
+  width: 518
+  back_context: 0
+  forward_context: 0
+  depth_type: null
+  nuscenes_version: 'mcap_preprocessed'
+  context_span: 6
+  cameras: ['camera0', 'camera1', 'camera2', 'camera3', 'camera4', 'camera5']
+  train_requirements: (gt_pose, gt_ego_pose)
+  val_requirements: (gt_pose, gt_ego_pose)
+
+  batch_size: 1
+  data_shuffle: False
+  drop_last: False
+  num_workers: 0
+  num_epochs: 10

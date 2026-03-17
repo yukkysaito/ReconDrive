@@ -7,7 +7,31 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from pytorch3d.transforms import axis_angle_to_matrix 
+
+
+def axis_angle_to_matrix(axis_angle):
+    """Convert axis-angle rotations to rotation matrices."""
+    angle = torch.linalg.norm(axis_angle, dim=-1, keepdim=True)
+    axis = axis_angle / angle.clamp_min(1e-8)
+
+    x, y, z = axis.unbind(dim=-1)
+    zeros = torch.zeros_like(x)
+
+    skew = torch.stack(
+        [
+            torch.stack([zeros, -z, y], dim=-1),
+            torch.stack([z, zeros, -x], dim=-1),
+            torch.stack([-y, x, zeros], dim=-1),
+        ],
+        dim=-2,
+    )
+
+    eye = torch.eye(3, dtype=axis_angle.dtype, device=axis_angle.device)
+    eye = eye.view(*([1] * (axis_angle.dim() - 1)), 3, 3)
+
+    sin_term = torch.sin(angle)[..., None]
+    cos_term = (1.0 - torch.cos(angle))[..., None]
+    return eye + sin_term * skew + cos_term * (skew @ skew)
 
 
 def vec_to_matrix(rot_angle, trans_vec, invert=False):

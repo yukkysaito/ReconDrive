@@ -11,6 +11,7 @@ import torch
 
 from dataset.data_util import train_transforms, inference_transforms
 from dataset.vggt4dgs_scene_dataset import NuScenesdataset4D as NuScenesDataset
+from dataset.mcap_scene_dataset import McapSceneDataset
 
 
 class SceneDataLoader:
@@ -196,9 +197,16 @@ class VGGT3DGS_SceneDataModule(pl.LightningDataModule):
             'with_pose': 'gt_pose' in self.train_requirements,
             'with_ego_pose': 'gt_ego_pose' in self.train_requirements,
             'with_mask': 'mask' in self.train_requirements,
+            'cache_dir': getattr(self, 'cache_dir', ''),
+            'nuscenes_version': getattr(self, 'nuscenes_version', 'interp_12Hz_trainval'),
+            'context_span': getattr(self, 'context_span', 6),
         }
         
-        dataset = NuScenesDataset(self.data_path, mode, **dataset_args)
+        dataset_type = getattr(self, "dataset_type", "nuscenes")
+        if dataset_type == "mcap_preprocessed":
+            dataset = McapSceneDataset(self.data_path, mode, **dataset_args)
+        else:
+            dataset = NuScenesDataset(self.data_path, mode, **dataset_args)
 
         return dataset
 
